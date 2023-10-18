@@ -10,3 +10,8 @@ exclude = "main\\.py"
 profile = "black"
 combine_as_imports = true
 skip_gitignore = true
+
+
+[tool.ruff]
+ignore = ["E501"]
+unfixable = ["F401"]
