@@ -1,8 +1,10 @@
 import os
+from pprint import pprint
 import io
 import re
 import base64
 import logging
+from typing_extensions import override
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -42,22 +44,21 @@ def upload_to_imgur(fig) -> Optional[str]:
         imgur_uploaded_link = response.json()["data"]["link"]
         print(imgur_uploaded_link)
         print(type(imgur_uploaded_link))
-        logging.info("Succesfully uploaded! Image URL is", imgur_uploaded_link)
+        logging.info(f"Succesfully uploaded! Image URL is {imgur_uploaded_link}")
         return imgur_uploaded_link
     else:
         logging.info("Could not upload to imgur")
         return None
 
 
-def type_check(input: str) -> str:
+def type_check(input):
     """
     handling return type of running generated code. If result is just a string, then return that.
     If its a pandas type then return as a markdown table.
     """
-    if isinstance(input, str):
-        return input
-    if isinstance(input, pd.DataFrame) or isinstance(input, pd.Series):
-        return input.to_markdown()
+    if isinstance(input, (pd.DataFrame, pd.Series)): 
+        input = input.to_markdown()
+    return input
 
 
 def update_temperature(
@@ -67,6 +68,15 @@ def update_temperature(
     request.temperature = new_temperature
     logging.info(f"updated temperature: {request.temperature}")
     return request
+
+
+def check_final_output_length(response):
+    """
+    there is a 100000 character limit for responses.
+    most likely the character limit will be hit because we are printing the resulting df as a table.
+    we need to truncate the result if it is too long.
+    """
+    ...
 
 
 def set_system_prompt(request: QueryRequest) -> QueryRequest:
@@ -80,7 +90,7 @@ def set_system_prompt(request: QueryRequest) -> QueryRequest:
     Keep in mind that the code you return will be run using python's exec() function. """
     if request.query[0].role != "system":
         # no system prompt set
-        system_message = ProtocolMessage(role = "system", content=system_prompt)
+        system_message = ProtocolMessage(role="system", content=system_prompt)
         request.query = [system_message] + request.query
     return request
 
@@ -93,10 +103,31 @@ def apply_template(df: pd.DataFrame, query: str) -> str:
         The head of the dataframe is {df.head()} Query: {query}"""
 
 
-class EDA_bot(PoeBot):
-    def check_attachment_on_latest_message(self, request: QueryRequest):
-        return len(request.query[-1].attachments) > 0
+async def concat_stream_request(request, bot):
+    output_list = []
+    async for msg in stream_request(request, bot, request.access_key):
+        output_list.append(msg.text)
+    return output_list
 
+
+def check_attachment_on_latest_message(request: QueryRequest):
+    return len(request.query[-1].attachments) > 0
+
+
+def code_runner(code: str, request: QueryRequest):
+    f = StringIO()
+    with redirect_stdout(f):
+        exec(code)
+        exec("\nprint(type_check(output_df))")
+        if "--plot" in request.query[-1].content:
+            exec("\nprint(upload_to_imgur(fig))")
+
+    printed_output = f.getvalue()
+    return "\n".join(printed_output.strip().split("\n")[:-1]) + "\n"
+
+
+class EDA_bot(PoeBot):
+    @override
     async def get_settings(self, setting: SettingsRequest) -> SettingsResponse:
         return SettingsResponse(
             server_bot_dependencies={BASE_BOT: 1},
@@ -104,13 +135,14 @@ class EDA_bot(PoeBot):
             introduction_message="",
         )
 
+    @override
     async def get_response(
         self, request: QueryRequest
     ) -> AsyncIterable[PartialResponse]:
         request = update_temperature(request)
         request = set_system_prompt(request)
-        print(request.query)
-        if self.check_attachment_on_latest_message(request):
+        pprint(request.query)
+        if check_attachment_on_latest_message(request):
             logging.info("There is an attachment")
             attachment_info = request.query[-1].attachments[0]
             attachment_url = attachment_info.url
@@ -128,12 +160,6 @@ class EDA_bot(PoeBot):
                 df = pd.read_csv(io.StringIO(csv_data))
                 logging.info(df.head(1))
 
-                async def concat_stream_request(request, bot):
-                    output_list = []
-                    async for msg in stream_request(request, bot, request.access_key):
-                        output_list.append(msg.text)
-                    return output_list
-
                 request.query[-1].content = apply_template(
                     df, request.query[-1].content
                 )
@@ -142,22 +168,12 @@ class EDA_bot(PoeBot):
                 code_blocks = re.findall(
                     r"```\s*python(.*?)```", joined_messages, re.DOTALL
                 )
+                joined_code_blocks = "".join(code_blocks)
 
                 logging.info(joined_messages)
                 logging.info(f"{code_blocks=}")
                 logging.info(f"{len(code_blocks)=}")
-                joined_code_blocks = "".join(code_blocks)
-                f = StringIO()
-                with redirect_stdout(f):
-                    exec(joined_code_blocks)
-                    exec("\nprint(type_check(output_df))")
-                    if "--plot" in request.query[-1].content:
-                        exec("\nprint(upload_to_imgur(fig))")
-
-                printed_output = f.getvalue()
-                printed_output_clean = (
-                    "\n".join(printed_output.strip().split("\n")[:-1]) + "\n"
-                )
+                printed_output = code_runner(joined_code_blocks, request)
                 print(f"{printed_output=}")
                 if "--plot" in request.query[-1].content:
                     imgur_link = printed_output.strip().split("\n")[-1]
