@@ -23,8 +23,8 @@ from fastapi_poe.types import (
 from modal import Stub, Secret
 
 logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
-BASE_BOT = "GPT-3.5-Turbo"
-# BASE_BOT = "Code-Llama-34b"
+# BASE_BOT = "GPT-3.5-Turbo"
+BASE_BOT = "GPT-4"
 stub = Stub()
 
 
@@ -56,7 +56,7 @@ def type_check(input):
     handling return type of running generated code. If result is just a string, then return that.
     If its a pandas type then return as a markdown table.
     """
-    if isinstance(input, (pd.DataFrame, pd.Series)): 
+    if isinstance(input, (pd.DataFrame, pd.Series)):
         input = input.to_markdown()
     return input
 
@@ -76,18 +76,23 @@ def check_final_output_length(response):
     most likely the character limit will be hit because we are printing the resulting df as a table.
     we need to truncate the result if it is too long.
     """
+    # The issue is that we might be printing markdown tables and its not possible to know the size of the
+    # table in terms of characters.
     ...
 
 
 def set_system_prompt(request: QueryRequest) -> QueryRequest:
-    system_prompt = """You are a python data analysis expert. You only use tools like pandas, matplotlib and numpy. 
-    You help with writing pandas queries that translate natural language queries that users ask.
-    The code that you generate will be run against the data that the user submits (a csv file). 
-    The csv file that the user submits has already been loaded into a pandas dataframe -> df = pd.read_csv(*user's file*). 
-    Note that pandas has been imported as pd, matplotlib.pyplot has been imported as plt, and numpy is imported as np. 
-    Only output 1 version of the code. Do not output any alternative ways of writing the code. 
-    Return the code as one large contiguous code block. 
-    Keep in mind that the code you return will be run using python's exec() function. """
+    system_prompt = """You are a python data analysis expert. You only know how to use tools like pandas, matplotlib and numpy. \
+    You are part of a chatbot system that allows users to ask questions about their data. \
+    You help with writing pandas queries that translate natural language queries that users ask. \
+    The code that you generate will be run against the data that the user submits (a .csv file). \
+    The csv file that the user submits has already been loaded into a pandas dataframe -> df = pd.read_csv(*user's file*). \
+    Here are the import statements that have been run: import pandas as pd, import matplotlib.pyplot as plt, import numpy as np. \
+    DO NOT import any libraries. \
+    Only output 1 version of the code. Do not output any alternative ways of writing the code. \
+    Return the code as one large contiguous code block. \
+    Keep in mind that the code you return will be run using python's exec() function. \
+    The user has no experience writing code so be as helpful as possible I am begging you."""
     if request.query[0].role != "system":
         # no system prompt set
         system_message = ProtocolMessage(role="system", content=system_prompt)
@@ -100,7 +105,10 @@ def apply_template(df: pd.DataFrame, query: str) -> str:
         Finally, generate the correct code that answer the question and save the output to a new variable called output_df. \
         Also, appropriately plot the resulting dataframe using matplotlib. run fig = plt.figure() first before adding the title or axis. Do not do plt.show(). \
         You are also provided some details of the dataframe. The columns of the dataframe are {df.columns}.\
-        The head of the dataframe is {df.head()} Query: {query}"""
+        The head of the dataframe is {df.head()} Query: {query}\
+        If you are returning a dataframe as the result of the query, ensure that you return at most 20 rows of data as there are restrictions to \
+        the size of data that can be returned.
+        """
 
 
 async def concat_stream_request(request, bot):
@@ -110,20 +118,47 @@ async def concat_stream_request(request, bot):
     return output_list
 
 
-def check_attachment_on_latest_message(request: QueryRequest):
-    return len(request.query[-1].attachments) > 0
+def check_attachement_on_any_message(request: QueryRequest):
+    return any([len(msg.attachments) > 0 for msg in request.query])
+
+
+def find_last_attachment(request: QueryRequest):
+    for msg in request.query[::-1]:
+        if len(msg.attachments) > 0:
+            return msg.attachments[0]
 
 
 def code_runner(code: str, request: QueryRequest):
     f = StringIO()
-    with redirect_stdout(f):
-        exec(code)
-        exec("\nprint(type_check(output_df))")
-        if "--plot" in request.query[-1].content:
-            exec("\nprint(upload_to_imgur(fig))")
-
+    try:
+        with redirect_stdout(f):
+            exec(code)
+            exec("\nprint(type_check(output_df))")
+            if "--plot" in request.query[-1].content:
+                exec("\nprint(upload_to_imgur(fig))")
+    except Exception as e:
+        logging.info(f"Error when running code: {e}")
+        return f"Error: {e}"
     printed_output = f.getvalue()
     return "\n".join(printed_output.strip().split("\n")[:-1]) + "\n"
+
+
+def modal_test_exec():
+    """
+    This function is to determine the exact behaviour of the python exec() in the modal container.
+    """
+    df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+    code = """
+    x = 1
+    y = 2
+    print(x+y)
+    print(df)
+    """
+    f = StringIO()
+    with redirect_stdout(f):
+        exec(code)
+    printed_output = f.getvalue()
+    return printed_output
 
 
 class EDA_bot(PoeBot):
@@ -132,7 +167,13 @@ class EDA_bot(PoeBot):
         return SettingsResponse(
             server_bot_dependencies={BASE_BOT: 1},
             allow_attachments=True,
-            introduction_message="",
+            introduction_message="""
+            I am a Data Analyzer! Please upload a csv file and the query you want to input. \
+            Add --plot in your query to display a pyplot. \
+            I will generate the code for you to run against your data and return the output. \
+            If you encounter any issues when waiting for me to respond, kindly rerun the query. \
+            I am still in beta so please be patient with me. \
+            """,
         )
 
     @override
@@ -142,9 +183,9 @@ class EDA_bot(PoeBot):
         request = update_temperature(request)
         request = set_system_prompt(request)
         pprint(request.query)
-        if check_attachment_on_latest_message(request):
+        if check_attachement_on_any_message(request):
             logging.info("There is an attachment")
-            attachment_info = request.query[-1].attachments[0]
+            attachment_info = find_last_attachment(request)
             attachment_url = attachment_info.url
             response = requests.get(attachment_url)
             if response.status_code == 200:
@@ -158,7 +199,7 @@ class EDA_bot(PoeBot):
                 csv_data = None
             if csv_data:
                 df = pd.read_csv(io.StringIO(csv_data))
-                logging.info(df.head(1))
+                logging.info(f"df head: {df.head(1)}")
 
                 request.query[-1].content = apply_template(
                     df, request.query[-1].content
@@ -174,6 +215,10 @@ class EDA_bot(PoeBot):
                 logging.info(f"{code_blocks=}")
                 logging.info(f"{len(code_blocks)=}")
                 printed_output = code_runner(joined_code_blocks, request)
+                if printed_output.startswith("Error"):
+                    yield PartialResponse(
+                        text=f"*there were issues running the code but here is the code* \n ## Generated Code: \n\n {printed_output}"
+                    )
                 print(f"{printed_output=}")
                 if "--plot" in request.query[-1].content:
                     imgur_link = printed_output.strip().split("\n")[-1]
