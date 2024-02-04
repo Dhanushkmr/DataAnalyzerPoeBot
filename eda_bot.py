@@ -28,7 +28,7 @@ BASE_BOT = "GPT-4"
 stub = Stub()
 
 
-@stub.function(secret=Secret.from_name("poe-access-key"))
+@stub.function(secrets=[Secret.from_name("poe-access-key")])
 def upload_to_imgur(fig) -> Optional[str]:
     client_id = os.environ["IMGUR_KEY"]
     buf = BytesIO()
@@ -62,12 +62,21 @@ def type_check(input):
 
 
 def update_temperature(
-    request: QueryRequest, new_temperature: float = 0.2
+    request: QueryRequest, new_temperature: float = 0.1
 ) -> QueryRequest:
     logging.info(f"current temperature: {request.temperature}")
     request.temperature = new_temperature
     logging.info(f"updated temperature: {request.temperature}")
     return request
+
+
+def truncate_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Truncate the dataframe to 60000 characters (in markdown foramt) if the dataframe is too large.
+    """
+    while len(df.to_markdown()) > 60000:
+        df = df.head(len(df) - 1)
+    return df
 
 
 def check_final_output_length(response):
@@ -76,9 +85,9 @@ def check_final_output_length(response):
     most likely the character limit will be hit because we are printing the resulting df as a table.
     we need to truncate the result if it is too long.
     """
-    # The issue is that we might be printing markdown tables and its not possible to know the size of the
-    # table in terms of characters.
-    ...
+    if len(response) > 100000:
+        response = response[:100000]
+    return response
 
 
 def set_system_prompt(request: QueryRequest) -> QueryRequest:
@@ -86,12 +95,34 @@ def set_system_prompt(request: QueryRequest) -> QueryRequest:
     You are part of a chatbot system that allows users to ask questions about their data. \
     You help with writing pandas queries that translate natural language queries that users ask. \
     The code that you generate will be run against the data that the user submits (a .csv file). \
-    The csv file that the user submits has already been loaded into a pandas dataframe -> df = pd.read_csv(*user's file*). \
-    Here are the import statements that have been run: import pandas as pd, import matplotlib.pyplot as plt, import numpy as np. \
-    DO NOT import any libraries. \
+    Here is the structure of the code that you need to fill in: \
+    ```python
+    # start of code that has already been written
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    df = pd.read_csv(*user's file*)
+    # end of code that has already been written. Do not generate code for this part above. It is already written for you.
+
+    # Your code here based on the user's query. Here is an example of how you should structure the code:
+    <...> (fill in the code here based on the user's query)
+    # save the output to a new variable called `output_df`
+    output_df = <...>
+
+    # plot the resulting dataframe using matplotlib (if the user's query has --plot in it)
+    fig = plt.figure() # you must write this line first before adding the title or axis
+    plt.title("Title fill in") # replace "Title" with an appropriate title of the plot
+    plt.xlabel("X-axis") # replace "X-axis" with an appropriate title of the plot
+    plt.ylabel("Y-axis") # replace "Y-axis" with an appropriate title of the plot
+    ``` \
+    The csv file that the user submits has already been loaded into a pandas dataframe -> `df = pd.read_csv(*user's file*)`. \
+    Here are the import statements that have been run: `import pandas as pd`, `import matplotlib.pyplot as plt`, `import numpy as np`. \
+    DO NOT import any other libraries. \
     Only output 1 version of the code. Do not output any alternative ways of writing the code. \
     Return the code as one large contiguous code block. \
     Keep in mind that the code you return will be run using python's exec() function. \
+    Think step by step and provide the reasoning for each step. \
     The user has no experience writing code so be as helpful as possible I am begging you."""
     if request.query[0].role != "system":
         # no system prompt set
@@ -101,17 +132,19 @@ def set_system_prompt(request: QueryRequest) -> QueryRequest:
 
 
 def apply_template(df: pd.DataFrame, query: str) -> str:
-    return f"""You are given a pandas dataframe with the variable name df. Follow the query provided and generate the reasoning to answer the question. \
-        Finally, generate the correct code that answer the question and save the output to a new variable called output_df. \
-        Also, appropriately plot the resulting dataframe using matplotlib. run fig = plt.figure() first before adding the title or axis. Do not do plt.show(). \
+    return f"""You are given a pandas dataframe with the variable name `df`. Follow the query provided and generate the reasoning to answer the question. \
+        Finally, generate the correct code that answer the question and save the output to a new variable called `output_df`. \
+        
+        Also, appropriately plot the resulting dataframe using matplotlib. run `fig = plt.figure()` first before adding the title or axis. Do not do `plt.show()`. \
         You are also provided some details of the dataframe. The columns of the dataframe are {df.columns}.\
-        The head of the dataframe is {df.head()} Query: {query}\
-        If you are returning a dataframe as the result of the query, ensure that you return at most 20 rows of data as there are restrictions to \
-        the size of data that can be returned.
+        The head of the dataframe is {df.head()} Query: {query}\n
         """
 
 
 async def concat_stream_request(request, bot):
+    """
+    This function is to concatenate all the messages from the stream_request into one large string.
+    """
     output_list = []
     async for msg in stream_request(request, bot, request.access_key):
         output_list.append(msg.text)
@@ -132,10 +165,14 @@ def code_runner(code: str, request: QueryRequest):
     f = StringIO()
     try:
         with redirect_stdout(f):
-            exec(code)
-            exec("\nprint(type_check(output_df))")
+            exec(code, globals())
+            exec(
+                "\nprint(type_check(output_df))"
+            )  # remove this and handle the df printing outside the exec
             if "--plot" in request.query[-1].content:
-                exec("\nprint(upload_to_imgur(fig))")
+                exec(
+                    "\nprint(upload_to_imgur(fig))"
+                )  # remove this and handle the plot outside the exec
     except Exception as e:
         logging.info(f"Error when running code: {e}")
         return f"Error: {e}"
@@ -143,22 +180,29 @@ def code_runner(code: str, request: QueryRequest):
     return "\n".join(printed_output.strip().split("\n")[:-1]) + "\n"
 
 
-def modal_test_exec():
+def modal_test_exec(df):
     """
     This function is to determine the exact behaviour of the python exec() in the modal container.
     """
-    df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
-    code = """
-    x = 1
-    y = 2
-    print(x+y)
-    print(df)
-    """
+
+    globals()["df"] = df
+    code = """x = 1\ny = 2\nprint(x+y)\nprint(df)\ndf.head(1)"""
     f = StringIO()
     with redirect_stdout(f):
-        exec(code)
+        exec(code, globals())
     printed_output = f.getvalue()
+    print("df printing outside!!: ", df)
+    print("x printing outside!!: ", x)
     return printed_output
+
+
+def stitch_code(code: str) -> str:
+    code_blocks = re.findall(r"```\s*python(.*?)```", code, re.DOTALL)
+    joined_code_blocks = "".join(code_blocks)
+    logging.info(code)
+    logging.info(f"{code_blocks=}")
+    logging.info(f"{len(code_blocks)=}")
+    return joined_code_blocks
 
 
 class EDA_bot(PoeBot):
@@ -182,7 +226,13 @@ class EDA_bot(PoeBot):
     ) -> AsyncIterable[PartialResponse]:
         request = update_temperature(request)
         request = set_system_prompt(request)
-        pprint(request.query)
+        logging.info(f"{request.query=}")
+        logging.info("exec testing")
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        test_output = modal_test_exec(df)
+        logging.info("x printing REALLY outside!!: ", x)
+        logging.info(f"exec test: \n {test_output}")
+        logging.info("exec testing run complete")
         if check_attachement_on_any_message(request):
             logging.info("There is an attachment")
             attachment_info = find_last_attachment(request)
@@ -196,9 +246,13 @@ class EDA_bot(PoeBot):
                 logging.info(
                     f"Failed to download CSV. Status code: {response.status_code}"
                 )
-                csv_data = None
+                yield PartialResponse(
+                    text=f"Error: Failed to download CSV. Status code: {response.status_code}"
+                )
+
             if csv_data:
                 df = pd.read_csv(io.StringIO(csv_data))
+                globals()["df"] = df
                 logging.info(f"df head: {df.head(1)}")
 
                 request.query[-1].content = apply_template(
@@ -206,15 +260,9 @@ class EDA_bot(PoeBot):
                 )
                 concatenated_msgs = await concat_stream_request(request, BASE_BOT)
                 joined_messages = "".join(concatenated_msgs)
-                code_blocks = re.findall(
-                    r"```\s*python(.*?)```", joined_messages, re.DOTALL
-                )
-                joined_code_blocks = "".join(code_blocks)
+                code = stitch_code(joined_messages)
+                printed_output = code_runner(code, request)
 
-                logging.info(joined_messages)
-                logging.info(f"{code_blocks=}")
-                logging.info(f"{len(code_blocks)=}")
-                printed_output = code_runner(joined_code_blocks, request)
                 if printed_output.startswith("Error"):
                     yield PartialResponse(
                         text=f"*there were issues running the code but here is the code* \n ## Generated Code: \n\n {printed_output}"
